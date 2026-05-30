@@ -50,9 +50,15 @@ class ChangeOrder(Base):
     # BUG-351: rejection populates its own fields — previously ``approved_by``
     # was reused on reject, which made UIs show the rejector as the approver.
     rejected_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    submitted_at: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    approved_at: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    rejected_at: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # These hold ISO-8601 timestamps stamped by the service via
+    # ``datetime.isoformat()`` (e.g. ``2026-05-30T09:58:00.688302+00:00`` = 32
+    # chars). String(20) silently passed on SQLite (no length enforcement) but
+    # raised ``StringDataRightTruncationError`` on PostgreSQL, breaking demo
+    # seeding and any real change-order submit/approve/reject. 40 leaves margin
+    # for microseconds and non-UTC offsets.
+    submitted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    approved_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    rejected_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # Phase 2e: signed money column (scope changes can be negative on credits).
     cost_impact: Mapped[Decimal] = mapped_column(MoneyType(), nullable=False, default=Decimal("0"))
     schedule_impact_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -65,7 +71,9 @@ class ChangeOrder(Base):
     # Variation fields (Phase 16 enhancement)
     variation_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     cost_basis: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    contractor_submission_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # ISO-8601 timestamp string — see note on submitted_at above (was String(20),
+    # too short for PostgreSQL).
+    contractor_submission_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
     contractor_amount: Mapped[Decimal | None] = mapped_column(MoneyType(), nullable=True)
     engineer_amount: Mapped[Decimal | None] = mapped_column(MoneyType(), nullable=True)
     approved_amount: Mapped[Decimal | None] = mapped_column(MoneyType(), nullable=True)
