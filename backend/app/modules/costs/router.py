@@ -3175,12 +3175,11 @@ async def load_cwicr_database(
     from app.config import get_settings
 
     settings = get_settings()
-    sqlite_url = settings.database_url
-    db_file = sqlite_url.split("///")[-1] if "///" in sqlite_url else "openestimate.db"
+    db_url = settings.database_url
 
-    # Run in thread to avoid blocking the event loop during heavy pandas + sqlite work.
+    # Run in thread to avoid blocking the event loop during heavy pandas + DB work.
     try:
-        result_data = await asyncio.to_thread(_process_and_insert_cwicr, str(cwicr_path), db_id, db_file)
+        result_data = await asyncio.to_thread(_process_and_insert_cwicr, str(cwicr_path), db_id, db_url)
     except Exception:
         logger.exception("CWICR import failed for %s", db_id)
         raise HTTPException(
@@ -3231,16 +3230,76 @@ async def load_cwicr_database(
     return result_data
 
 
-def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
-    """Process CWICR parquet + insert into SQLite. Runs in a SEPARATE PROCESS.
+def _insert_cost_rows(rows: list[dict[str, Any]], db_url: str) -> int:
+    """Bulk-insert cost rows on whichever database backend is configured.
 
-    Uses vectorized pandas (no iterrows!) + micro-batch SQLite inserts.
-    Completely bypasses GIL — the main process event loop stays responsive.
+    The previous CWICR importer opened a raw ``sqlite3`` connection and used
+    ``INSERT OR IGNORE`` plus SQLite-only PRAGMAs. On a PostgreSQL deployment
+    that silently created a brand-new empty SQLite file at the relative path
+    and inserted into *that*, so the catalogue never reached Postgres and the
+    UI failed with ``no such table: oe_costs_item``.
+
+    This opens a short-lived **synchronous** SQLAlchemy engine (this runs in a
+    worker thread, so the async engine can't be reused) and issues one
+    transaction with a dialect-aware ``ON CONFLICT DO NOTHING`` — preserving
+    the old "skip duplicate (code, region) rows" semantics on both SQLite and
+    PostgreSQL. Returns the number of rows sent (duplicates skipped by the
+    conflict clause are still counted, matching the legacy return value).
     """
-    import json as _json
+    if not rows:
+        return 0
+
+    from sqlalchemy import create_engine
+
+    from app.modules.costs.models import CostItem
+
+    # Async driver URLs can't drive a sync engine — swap to the sync driver.
+    # psycopg2 ships with the backend's ``[server]`` extra.
+    sync_url = db_url
+    if sync_url.startswith("sqlite"):
+        sync_url = sync_url.replace("+aiosqlite", "")
+    elif sync_url.startswith("postgresql"):
+        sync_url = sync_url.replace("+asyncpg", "+psycopg2")
+
+    engine = create_engine(sync_url)
+    try:
+        dialect = engine.dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _dialect_insert
+
+            stmt = _dialect_insert(CostItem.__table__).on_conflict_do_nothing()
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as _dialect_insert
+
+            stmt = _dialect_insert(CostItem.__table__).on_conflict_do_nothing()
+        else:  # pragma: no cover — other backends: best-effort plain insert
+            from sqlalchemy import insert as _plain_insert
+
+            stmt = _plain_insert(CostItem.__table__)
+
+        sent = 0
+        chunk_size = 1000
+        # One transaction for the whole import — the old code's key perf win
+        # (a single commit instead of a commit per micro-batch).
+        with engine.begin() as conn:
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i : i + chunk_size]
+                conn.execute(stmt, chunk)
+                sent += len(chunk)
+        return sent
+    finally:
+        engine.dispose()
+
+
+def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_url: str) -> dict[str, Any]:
+    """Process a CWICR parquet and insert it into the cost catalogue.
+
+    Uses vectorized pandas for the heavy aggregation and a dialect-aware bulk
+    insert (``_insert_cost_rows``) so the import works on both SQLite and
+    PostgreSQL. Runs in a worker thread so the event loop stays responsive.
+    """
     import logging
     import math
-    import sqlite3
     import time
 
     import pandas as pd
@@ -3596,31 +3655,12 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
 
         _log.info("Built resources for %d rate_codes in %.1fs", len(resources_by_code), time.monotonic() - start)
 
-    # 5. Open SQLite with aggressive write tuning — single transaction, no
-    # per-batch commits. Empirically: micro-batch commits were the bottleneck
-    # (275 fsyncs × ~250ms = ~70s). One big transaction + synchronous=NORMAL
-    # brings insert phase from ~70s down to ~3-5s for 55K rows.
-    # isolation_level=None → we manage BEGIN/COMMIT manually (no auto-begin
-    # from the sqlite3 driver that could conflict with our transaction).
-    conn = sqlite3.connect(db_file, timeout=60, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-20000")  # 20 MB cache
-
-    sql = """INSERT OR IGNORE INTO oe_costs_item
-        (id, code, description, unit, rate, currency, source,
-         classification, tags, components, descriptions,
-         is_active, region, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
-
-    imported = 0
+    # 5. Build the row payloads, then hand them to the dialect-aware bulk
+    # insert. (The previous version opened a raw sqlite3 connection here and
+    # used INSERT OR IGNORE + SQLite-only PRAGMAs, which broke PostgreSQL
+    # deployments — see _insert_cost_rows.)
     skipped_count = 0
-    # Bigger chunk and only ONE commit at the end
-    flush_every = 5000
-    batch: list[tuple] = []
-    conn.execute("BEGIN IMMEDIATE")
+    rows: list[dict[str, Any]] = []
 
     for rate_code, row in grouped.iterrows():
         desc = _safe_str(row.get("_desc", ""))
@@ -3720,37 +3760,29 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
         # Get full resource components for this rate_code
         components = resources_by_code.get(code, [])
 
-        batch.append(
-            (
-                str(uuid.uuid4()),
-                code,
-                desc[:500],
-                unit,
-                str(rate),
-                "",
-                "cwicr",
-                _json.dumps(classification),
-                "[]",
-                _json.dumps(components),
-                "{}",
-                1,
-                db_id,
-                _json.dumps(metadata),
-            )
+        # Native Python types — SQLAlchemy's column types serialize the JSON
+        # dicts/lists and coerce the boolean per dialect. ``created_at`` /
+        # ``updated_at`` are filled by their server_default; ``id`` is a GUID.
+        rows.append(
+            {
+                "id": uuid.uuid4(),
+                "code": code,
+                "description": desc[:500],
+                "unit": unit,
+                "rate": str(rate),
+                "currency": "",
+                "source": "cwicr",
+                "classification": classification,
+                "tags": [],
+                "components": components,
+                "descriptions": {},
+                "is_active": True,
+                "region": db_id,
+                "metadata": metadata,
+            }
         )
 
-        if len(batch) >= flush_every:
-            conn.executemany(sql, batch)
-            imported += len(batch)
-            batch.clear()
-
-    # Final chunk (still inside the BEGIN)
-    if batch:
-        conn.executemany(sql, batch)
-        imported += len(batch)
-
-    conn.execute("COMMIT")  # single commit — one fsync for the whole import
-    conn.close()
+    imported = _insert_cost_rows(rows, db_url)
     elapsed = round(time.monotonic() - start, 1)
     _log.info("CWICR %s: %d imported, %d skipped in %.1fs", db_id, imported, skipped_count, elapsed)
 
