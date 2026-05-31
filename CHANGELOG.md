@@ -5,6 +5,131 @@ All notable changes to OpenConstructionERP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.1.2] - 2026-05-31
+
+### Added
+
+- Linux CAD and BIM converters now download and install automatically on first
+  use, exactly like on Windows. The proprietary DDC converter binaries ship as
+  signed .deb packages; the app fetches the package index, resolves the
+  transitive dependencies, downloads them and unpacks them into a private
+  per-architecture directory under ~/.openestimator with no root, no Docker and
+  no apt setup. The same one-click flow backs the Install button on the
+  Quantities and BIM pages. amd64 is fully supported; on an architecture the
+  upstream repository does not publish yet, the app falls back to a clear apt
+  command instead of failing.
+
+### Fixed
+
+- macOS: the converters no longer try to launch a Windows .exe. There is no
+  native macOS build, so the app now says so plainly and points to the two
+  paths that work on a Mac: run in Docker, or upload an IFC file (IFC is read by
+  a built-in text parser that needs no native converter on any platform).
+- Claude and the other AI providers connect again. The model identifiers were
+  refreshed to the current Claude generation, the API key is now read from the
+  environment and from ~/.openestimate/config.json in addition to the database,
+  and provider and key problems are reported with the real reason instead of a
+  generic failure.
+- The converter version check no longer shows a false "update available" banner
+  on Linux and macOS, where the Windows binary comparison does not apply.
+
+## [6.1.1] - 2026-05-31
+
+### Fixed
+
+- Release pipeline: the Docker image tag is now lowercased before it is pushed
+  to GHCR, so the container image publishes correctly. GHCR rejects any tag
+  whose repository path contains uppercase letters.
+- Desktop builds: raised the Node heap limit for the frontend build so the
+  macOS installer job no longer runs out of memory.
+
+## [6.1.0] - 2026-05-31
+
+### Added
+
+- Flagship reference project: a single residential house built from one real
+  DWG drawing, one Revit model, one IFC model and one PDF plan set. Each CAD
+  and BIM file is converted through the DDC cad2data console converters into
+  our canonical JSON, with no IfcOpenShell and no native IFC parsing. Element
+  groups are linked to bill-of-quantities positions with real quantities, real
+  CWICR cost rates and real resources, with navigation both ways: from a BOQ
+  line to its model elements and from any element back to its BOQ line.
+- Automatic CAD and BIM converter download on first use, with no manual install
+  step.
+
+### Changed
+
+- Showcase demo seeding is now opt-in (set `SEED_SHOWCASE=true`); the flagship
+  reference project always installs.
+
+### Fixed
+
+- Broad audit fix wave: owner checks and IDOR hardening on BOQ exports,
+  currency-correct money handling, RBAC and permission registration fixes,
+  API contract corrections, project geo-hub map rendering with OpenStreetMap
+  tiles, a PWA service-worker MIME-type fix, and silent session refresh so long
+  sessions no longer drop to the login screen.
+
+## [6.0.0] - 2026-05-30
+
+### Changed
+
+- **PostgreSQL is now the default database, with zero setup.** A fresh
+  `openconstructionerp serve` boots a real in-process PostgreSQL 16 cluster
+  (bundled binaries, no Docker, no separate install) and stores its data under
+  `~/.openestimate/pgdata`. The single-file SQLite database is still available
+  as an opt-out escape hatch - run with `--sqlite` or set `OE_USE_SQLITE=1`.
+  This is the headline change of the 6.0 series and the reason for the major
+  version bump.
+- **Transparent one-time data migration.** On first boot, if a legacy
+  `openestimate.db` is present and the embedded cluster is empty, its data is
+  copied into PostgreSQL automatically and the old file is retired to
+  `openestimate.db.migrated`. Nothing to run by hand.
+- The PostgreSQL drivers (`asyncpg`, `psycopg2-binary`) and the embedded server
+  (`pixeltable-pgserver`) moved into the base dependencies, so `pip install
+  openconstructionerp` ships everything needed for the default PostgreSQL path.
+  The `[server]` extra is now just Celery + boto3.
+
+### Fixed
+
+- **15 PostgreSQL dialect bugs** that previously only worked on SQLite: tolerant
+  numeric coercion for money-as-text columns (no more `invalid input syntax` on
+  a malformed row), timezone-aware datetime binding for `TIMESTAMPTZ` columns,
+  `GROUP BY` on JSONB expressions instead of output aliases, `jsonb_array_length`
+  on JSONB columns, `string_agg` in place of SQLite-only `GROUP_CONCAT`,
+  UTC-normalised timestamp writes for lexically-ordered date columns, and
+  consistent BIM dynamic-group filtering across both backends.
+- A dedicated embedded-PostgreSQL regression suite (`backend/tests/pg`) runs in
+  CI against a real PG16 cluster so these dialect differences cannot regress.
+
+## [5.9.2] - 2026-05-30
+
+### Added
+
+- **PostgreSQL scale foundation** - generic JSON columns now emit `JSONB`
+  on PostgreSQL (GIN-indexable, fast containment queries); SQLite is
+  unchanged. PostgreSQL is fully optional - the default zero-dependency
+  SQLite path (`pip install openconstructionerp` and one command, no
+  Docker) is untouched.
+- **Automatic performance indexes on PostgreSQL** - foreign-key btree
+  indexes, composite `(project_id, created_at)` and `(project_id, status)`
+  indexes, and GIN indexes on path-queried JSON columns, emitted at
+  schema creation.
+- **SQLite-to-PostgreSQL migration script**
+  (`backend/app/scripts/migrate_sqlite_to_postgres.py`) - streams every
+  table, resets sequences, with `--truncate` / `--dry-run` / `--only`.
+
+### Changed
+
+- **Connection pooling hardening** - `pool_pre_ping` and `pool_recycle`
+  on PostgreSQL; configurable pool size and overflow on both backends.
+- **CWICR cost-database bulk import** is now PostgreSQL-safe
+  (`INSERT ... ON CONFLICT DO NOTHING`), with the fast raw-SQLite path
+  retained.
+- **Packaging** - removed stale "openestimate" branding from the
+  PyPI-facing metadata (keywords) so the project page reads as
+  OpenConstructionERP throughout.
+
 ## [5.9.1] - 2026-05-30
 
 **Stability and correctness hardening, plus sharper flags and partner logos.**
@@ -2537,7 +2662,7 @@ Five-category deep audit (Planning, Communication, Procurement, Finance, Documen
 ## [2.8.5] — 2026-05-04
 
 ### Fixed
-- Fresh-install registration: the seeded `demo@openestimator.io` admin no longer blocks the bootstrap path. First real self-registered user is now correctly promoted to admin and `is_active=True`, regardless of `OE_REGISTRATION_MODE`. Previously, every `pip install openconstructionerp` left new users dormant with no path forward.
+- Fresh-install registration: the seeded `demo@openconstructionerp.com` admin no longer blocks the bootstrap path. First real self-registered user is now correctly promoted to admin and `is_active=True`, regardless of `OE_REGISTRATION_MODE`. Previously, every `pip install openconstructionerp` left new users dormant with no path forward.
 - `/projects/:projectId/boq` only fetches that project's BOQs instead of fanning out to every project, cutting skeleton time on prod (50+ projects) from ~2 s to one round-trip.
 
 ### Tests

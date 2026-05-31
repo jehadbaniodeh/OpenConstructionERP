@@ -162,7 +162,7 @@ def print_startup_banner(
         print(f"  {_dim('API only (frontend not bundled). Docs:')} {url}/api/docs")
     print()
     print(f"  {_bold('Demo login')} {_dim('(auto-created on first run)')}")
-    print(f"    {_dim('Email:')}    demo@openestimator.io")
+    print(f"    {_dim('Email:')}    demo@openconstructionerp.com")
     print(f"    {_dim('Password:')} DemoPass1234!")
     print()
     print(f"  {_dim('Data directory:')} {data_dir}")
@@ -183,6 +183,33 @@ def _setup_env(data_dir: Path, host: str, port: int) -> None:
     (data_dir / "uploads").mkdir(exist_ok=True)
 
     db_path = data_dir / "openestimate.db"
+
+    # Embedded PostgreSQL (no Docker) is the DEFAULT runtime as of v6.0.0: boot a
+    # real in-process PG16 and point DATABASE_URL/DATABASE_SYNC_URL at it BEFORE
+    # the SQLite setdefault below (which then no-ops because the keys are already
+    # set). Opt out with OE_USE_SQLITE=1 (legacy single-file SQLite) or by setting
+    # your own DATABASE_URL. Must run before any ``from app...`` import that builds
+    # the engine — _setup_env is that earliest point for every command.
+    from app.core import embedded_pg
+
+    if embedded_pg.is_requested():
+        if embedded_pg.boot(data_dir):
+            # Transparent one-time SQLite -> PostgreSQL migration: if the box has
+            # a legacy openestimate.db and the embedded cluster is still empty,
+            # move the data over before the server starts. No-op otherwise.
+            status = embedded_pg.auto_migrate_legacy_sqlite(data_dir)
+            if status.startswith("migrated"):
+                print(_green(_u("✓ ", "OK ")) + status)
+            print(_green(_u("✓ ", "OK ")) + "Database: embedded PostgreSQL 16 (no Docker)")
+        else:
+            # pixeltable-pgserver missing or initdb failed: degrade to SQLite so
+            # the app still comes up. Surface it so the operator can install the
+            # server extra or set DATABASE_URL.
+            print(
+                _yellow(_u("⚠ ", "! "))
+                + "Embedded PostgreSQL unavailable; falling back to SQLite. "
+                + "Install with 'pip install openconstructionerp[server]' or set OE_USE_SQLITE=1 to silence."
+            )
 
     os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     os.environ.setdefault("DATABASE_SYNC_URL", f"sqlite:///{db_path}")
@@ -912,7 +939,7 @@ def print_welcome(*, next_command_hint: bool = True) -> None:
     print(f"    {_amber('openestimate doctor')}    {_dim('# health check if something looks wrong')}")
     print()
     print(f"  {_bold('After serve, open:')} {_amber('http://127.0.0.1:8080')}")
-    print(f"  {_dim('Demo login:')} demo@openestimator.io / DemoPass1234!")
+    print(f"  {_dim('Demo login:')} demo@openconstructionerp.com / DemoPass1234!")
     print()
     print(f"  {_bold('Get help or ask questions')}")
     print(f"    {_dim('Docs:')}      {DOCS_URL}")
@@ -1004,6 +1031,16 @@ def _add_common_server_args(p: argparse.ArgumentParser) -> None:
         default=str(DEFAULT_DATA_DIR),
         help=f"Data directory (default: {DEFAULT_DATA_DIR})",
     )
+    p.add_argument(
+        "--embedded-pg",
+        action="store_true",
+        help="Run an in-process PostgreSQL (no Docker); data in <data-dir>/pgdata (this is the default)",
+    )
+    p.add_argument(
+        "--sqlite",
+        action="store_true",
+        help="Use the legacy single-file SQLite database instead of embedded PostgreSQL",
+    )
 
 
 def main() -> None:
@@ -1016,7 +1053,7 @@ def main() -> None:
             "    openestimate init-db\n"
             "    openestimate serve\n"
             "\n"
-            "Then open http://localhost:8080 — log in with demo@openestimator.io / DemoPass1234!"
+            "Then open http://localhost:8080 — log in with demo@openconstructionerp.com / DemoPass1234!"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1094,6 +1131,16 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # Embedded PostgreSQL is the default (see embedded_pg.is_requested). The
+    # flags are explicit overrides mapped to the same env vars _setup_env reads
+    # before any app module (and therefore the engine) is imported:
+    #   --sqlite      → OE_USE_SQLITE=1     (escape hatch to legacy SQLite)
+    #   --embedded-pg → OE_USE_EMBEDDED_PG=1 (explicit; already the default)
+    if getattr(args, "sqlite", False):
+        os.environ["OE_USE_SQLITE"] = "1"
+    if getattr(args, "embedded_pg", False):
+        os.environ["OE_USE_EMBEDDED_PG"] = "1"
 
     if args.command == "serve":
         cmd_serve(args)

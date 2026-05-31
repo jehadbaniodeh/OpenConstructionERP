@@ -61,6 +61,9 @@ from app.dependencies import RequireRole, get_current_user_id
 logger = logging.getLogger(__name__)
 
 
+from app.core.sql_json import json_path_text
+
+
 def configure_logging(settings: Settings) -> None:
     """‌⁠‍Configure structured logging."""
     structlog.configure(
@@ -524,9 +527,9 @@ async def _seed_demo_account() -> None:
 
     Idempotent — safe to call on every startup. Creates:
 
-    * demo@openestimator.io        (role=admin — full walkthrough)
-    * estimator@openestimator.io   (role=estimator)
-    * manager@openestimator.io     (role=manager)
+    * demo@openconstructionerp.com        (role=admin — full walkthrough)
+    * estimator@openconstructionerp.com   (role=estimator)
+    * manager@openconstructionerp.com     (role=manager)
 
     Each password is read from the environment if set
     (``DEMO_USER_PASSWORD``, ``DEMO_ESTIMATOR_PASSWORD``,
@@ -552,19 +555,19 @@ async def _seed_demo_account() -> None:
     # Email → env-var-name mapping. Order matters for stable banner output.
     demo_account_specs: list[dict[str, str]] = [
         {
-            "email": "demo@openestimator.io",
+            "email": "demo@openconstructionerp.com",
             "env_var": "DEMO_USER_PASSWORD",
             "full_name": "Demo User",
             "role": "admin",
         },
         {
-            "email": "estimator@openestimator.io",
+            "email": "estimator@openconstructionerp.com",
             "env_var": "DEMO_ESTIMATOR_PASSWORD",
             "full_name": "Anna Musterfrau",
             "role": "editor",
         },
         {
-            "email": "manager@openestimator.io",
+            "email": "manager@openconstructionerp.com",
             "env_var": "DEMO_MANAGER_PASSWORD",
             "full_name": "Thomas Müller",
             "role": "manager",
@@ -582,7 +585,7 @@ async def _seed_demo_account() -> None:
             for acct in demo_account_specs:
                 exists = (await session.execute(select(User).where(User.email == acct["email"]))).scalar_one_or_none()
                 if exists is not None:
-                    if acct["email"] == "demo@openestimator.io":
+                    if acct["email"] == "demo@openconstructionerp.com":
                         demo = exists
                     # If operator set the env-var explicitly and the stored
                     # hash no longer matches that password, sync the hash so
@@ -609,7 +612,7 @@ async def _seed_demo_account() -> None:
                 )
                 session.add(user)
                 await session.flush()
-                if acct["email"] == "demo@openestimator.io":
+                if acct["email"] == "demo@openconstructionerp.com":
                     demo = user
                 logger.info(
                     "Demo user created: %s (password source: %s)",
@@ -645,10 +648,10 @@ async def _seed_demo_account() -> None:
 
             # 2. Capture the demo user ids while the session is open.
             estimator_user = (
-                await session.execute(select(User).where(User.email == "estimator@openestimator.io"))
+                await session.execute(select(User).where(User.email == "estimator@openconstructionerp.com"))
             ).scalar_one_or_none()
             manager_user = (
-                await session.execute(select(User).where(User.email == "manager@openestimator.io"))
+                await session.execute(select(User).where(User.email == "manager@openconstructionerp.com"))
             ).scalar_one_or_none()
             demo_user_id = str(demo.id)
             estimator_user_id = str(estimator_user.id) if estimator_user else ""
@@ -672,12 +675,19 @@ async def _seed_demo_account() -> None:
         # artifact is missing).
         if project_count == 0:
             showcase_done = False
-            showcase_disabled = os.environ.get("SEED_SHOWCASE", "true").lower() in (
-                "false",
-                "0",
-                "no",
+            # The flagship "Residential House" project (installed below) is now
+            # the single, deeply-worked reference showcase: real DDC-converted
+            # IFC/RVT/DWG models, geometry, and a CWICR-priced BIM-linked BOQ.
+            # The older multi-region localized snapshot (shallow auto-generated
+            # projects) and the 5 ORM demo projects are OPT-IN only now — set
+            # SEED_SHOWCASE=1 to restore them. A clean install therefore shows
+            # the flagship (plus a partner-pack project when a pack is active).
+            showcase_enabled = os.environ.get("SEED_SHOWCASE", "false").lower() in (
+                "1",
+                "true",
+                "yes",
             )
-            if not showcase_disabled:
+            if showcase_enabled:
                 db_path = _resolve_sqlite_db_path()
                 if db_path:
                     import asyncio
@@ -697,7 +707,7 @@ async def _seed_demo_account() -> None:
                     if result.get("status") in ("ok", "already") and result.get("projects"):
                         showcase_done = True
 
-            if not showcase_done:
+            if showcase_enabled and not showcase_done:
                 # Fresh-install fallback: cap strictly at 5 (DEFAULT_DEMO_IDS).
                 # Drift-prevention: if the constant ever exceeds five, we abort
                 # so a future PR can't silently re-introduce demo bloat.
@@ -771,6 +781,21 @@ async def _seed_demo_account() -> None:
                     logger.info("Showcase geometry seed: %s", geo_result)
                 except Exception:
                     logger.debug("Showcase geometry seed skipped", exc_info=True)
+
+        # Flagship "Residential House" reference project — a dialect-agnostic
+        # ORM installer (works on the embedded-Postgres default AND on SQLite)
+        # so the full CAD-to-BOQ showcase (real DDC-converted IFC/RVT geometry +
+        # a CWICR-priced, BIM-linked Bill of Quantities) is present out of the
+        # box. Idempotent, so it also backfills existing databases on the next
+        # startup. Runs regardless of project_count so an upgrade picks it up.
+        try:
+            from app.scripts.seed_flagship import install_flagship
+
+            async with async_session_factory() as fl_session:
+                fl_result = await install_flagship(fl_session, demo_user_id)
+                logger.info("Flagship seed: %s", fl_result)
+        except Exception:
+            logger.warning("Flagship seed skipped (non-fatal)", exc_info=True)
     except Exception:
         logger.exception("Failed to seed demo account (non-fatal)")
 
@@ -1125,8 +1150,8 @@ def create_app() -> FastAPI:
 
     # Partner-pack system — discovers pip-installed packs via entry_points
     # and exposes the active manifest + branded resources.
-    from app.core.partner_pack.router import router as partner_pack_router
     from app.core.partner_pack.discovery import get_active_pack
+    from app.core.partner_pack.router import router as partner_pack_router
 
     app.include_router(partner_pack_router)
     _active_pack = get_active_pack()
@@ -1587,10 +1612,28 @@ def create_app() -> FastAPI:
         """
         import asyncio
         import hashlib
+        import sys
 
         import httpx
 
         from app.modules.boq.cad_import import find_converter
+
+        # The git-blob SHA comparison below only applies to the Windows `.exe`
+        # builds fetched from the GitHub repo. On Linux/macOS the converters come
+        # from the signed apt repo (or aren't natively available), so there is no
+        # per-file SHA to compare — return a benign, non-alarming result so the
+        # dashboard never shows a false "update available" banner off-Windows.
+        if sys.platform != "win32":
+            return {
+                "network_ok": True,
+                "any_outdated": False,
+                "results": [],
+                "platform": sys.platform,
+                "note": (
+                    "Converter version checks apply to the Windows builds; this "
+                    "platform uses the DDC apt repository (Linux) or has no native build."
+                ),
+            }
 
         # Per-format directory inside the repo. Mirrors `_WINDOWS_CONVERTER_DIRS`
         # in takeoff/router.py — duplicated here so the system endpoint
@@ -1898,10 +1941,24 @@ def create_app() -> FastAPI:
                 detail="'subject' must be ≥3 chars and 'description' ≥10 chars.",
             )
 
-        # Auto-create table if needed (SQLite dev mode)
+        # Auto-create table if needed — dialect-aware so it works on both
+        # SQLite (dev) and PostgreSQL (prod). The INSERT below is identical
+        # on both back-ends because it binds ``created_at`` explicitly.
         async with engine.begin() as conn:
-            await conn.execute(
-                text("""
+            if conn.dialect.name == "postgresql":
+                create_sql = """
+                CREATE TABLE IF NOT EXISTS oe_feedback (
+                    id BIGSERIAL PRIMARY KEY,
+                    category TEXT NOT NULL DEFAULT 'general',
+                    subject TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    email TEXT,
+                    page_path TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """
+            else:
+                create_sql = """
                 CREATE TABLE IF NOT EXISTS oe_feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     category TEXT NOT NULL DEFAULT 'general',
@@ -1909,10 +1966,17 @@ def create_app() -> FastAPI:
                     description TEXT NOT NULL,
                     email TEXT,
                     page_path TEXT,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 )
-            """)
-            )
+            """
+            await conn.execute(text(create_sql))
+            # PostgreSQL's ``created_at`` is TIMESTAMPTZ: asyncpg rejects an ISO
+            # *string* ("expected datetime, got 'str'"), so bind a real aware
+            # datetime there. SQLite's column is TEXT, where binding a datetime
+            # object trips Python 3.12's deprecated default adapter — keep the
+            # ISO string for that dialect.
+            now_utc = datetime.now(UTC)
+            created_at_val: object = now_utc if conn.dialect.name == "postgresql" else now_utc.isoformat()
             await conn.execute(
                 text("""
                     INSERT INTO oe_feedback (category, subject, description, email, page_path, created_at)
@@ -1924,7 +1988,7 @@ def create_app() -> FastAPI:
                     "description": description,
                     "email": email,
                     "page_path": page_path,
-                    "created_at": datetime.now(UTC).isoformat(),
+                    "created_at": created_at_val,
                 },
             )
 
@@ -2447,12 +2511,10 @@ def create_app() -> FastAPI:
                     # 3) Distinct top-level categories — drives the category
                     #    filter dropdown. Warm the all-regions list (the
                     #    page's default before any region tab is clicked).
-                    from sqlalchemy import func as __func
-
                     from app.database import engine as __engine
 
                     if "sqlite" in str(__engine.url):
-                        coll_expr = __func.json_extract(CostItem.classification, "$.collection")
+                        coll_expr = json_path_text(CostItem.classification, "$.collection")
                     else:
                         coll_expr = CostItem.classification["collection"].as_string()
                     c = await cost_session.execute(
@@ -2570,7 +2632,7 @@ def create_app() -> FastAPI:
             # operator at that file beats baking a fixed password into
             # every running instance.
             logger.info(
-                "Demo login: demo@openestimator.io "
+                "Demo login: demo@openconstructionerp.com "
                 "(password from DEMO_USER_PASSWORD env var or "
                 "~/.openestimator/.demo_credentials.json)"
             )
@@ -2613,6 +2675,15 @@ def create_app() -> FastAPI:
             logger.debug("embedding pool shutdown failed", exc_info=True)
 
         await engine.dispose()
+
+        # Stop the embedded PostgreSQL cluster last (after the engine pool is
+        # closed), if this process booted one. No-op otherwise.
+        try:
+            from app.core import embedded_pg
+
+            embedded_pg.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug("embedded PostgreSQL shutdown skipped", exc_info=True)
 
     # ── Frontend Static Files (CLI / single-image mode) ─────────────────────
     # Registered HERE, before the app is returned from create_app(), so the

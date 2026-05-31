@@ -54,6 +54,7 @@ from app.modules.costs.intelligence import (
     CostUsageRecorder,
     RegionalIndexService,
 )
+from app.modules.costs.cwicr_v3_catalogue import CWICR_V3_CATALOGUES
 from app.modules.costs.matcher import (
     MatchResult,
     match_cwicr_for_position,
@@ -96,6 +97,9 @@ router = APIRouter(tags=["costs"])
 logger = logging.getLogger(__name__)
 
 
+from app.core.sql_json import json_path_text
+
+
 class CertaintyBatchRequest(BaseModel):
     """Request body for ``POST /v1/costs/certainty/batch``.
 
@@ -118,53 +122,46 @@ class CertaintyBatchRequest(BaseModel):
 #
 # CWICR catalogues are imported per-region, but the parquet files don't
 # carry an explicit currency column — every rate is denominated in the
-# region's local currency. Mirror the frontend ``REGION_MAP`` so we can
-# resolve the right ISO 4217 code at ingestion time AND lazily on read
-# for legacy rows that landed with ``currency = ''`` before this map
-# existed.
+# region's local currency. We resolve the right ISO 4217 code at ingestion
+# time (so rates persist with their true currency) AND lazily on read for
+# legacy rows that landed with ``currency = ''`` before this map existed.
 #
-# Keep the keys exactly aligned with the parquet ``db_id`` / ``region``
-# convention (UPPERCASE, country prefix). Unknown keys fall back to the
-# explicit currency on the row, then to "EUR" so the picker never crashes.
-_REGION_CURRENCY: dict[str, str] = {
-    "DE_BERLIN": "EUR",
-    "DE_MUNICH": "EUR",
+# Single source of truth: the v3 catalogue registry
+# (:data:`CWICR_V3_CATALOGUES`) already declares the ISO currency of every
+# region DDC ships. Deriving the map from it means new catalogue rows are
+# covered automatically and the two can never drift — the old hand-kept
+# literal omitted ~18 live regions (KES/GHS/KRW/THB/VND/…) and silently
+# mislabeled their rates as EUR.
+#
+# Legacy / alias keys that are NOT in the v3 registry (older parquet
+# ``db_id`` tags the importer still accepts) are merged on top so they keep
+# resolving. Keys follow the parquet ``db_id`` / ``region`` convention
+# (UPPERCASE, country prefix).
+_REGION_CURRENCY_LEGACY: dict[str, str] = {
     "DE_HAMBURG": "EUR",
-    "AT_VIENNA": "EUR",
-    "CH_ZURICH": "CHF",
-    "FR_PARIS": "EUR",
-    "ES_MADRID": "EUR",
-    "IT_ROME": "EUR",
-    "NL_AMSTERDAM": "EUR",
     "BE_BRUSSELS": "EUR",
-    "PT_LISBON": "EUR",
-    # NOTE: ``PT_SAOPAULO`` was historically present as ``BRL`` — that's a
-    # mislabeled entry (São Paulo is Brazil, prefix should be ``BR_``).
-    # Kept canonical key is ``BR_SAOPAULO`` (see below). The bogus
-    # ``PT_SAOPAULO`` is intentionally not registered here.
-    "GB_LONDON": "GBP",
     "IE_DUBLIN": "EUR",
-    "PL_WARSAW": "PLN",
-    "CZ_PRAGUE": "CZK",
-    "RO_BUCHAREST": "RON",
-    "RU_STPETERSBURG": "RUB",
-    "RU_MOSCOW": "RUB",
-    "USA_USD": "USD",
     "USA_NEWYORK": "USD",
-    "CA_TORONTO": "CAD",
-    "MX_MEXICO": "MXN",
-    "BR_SAOPAULO": "BRL",
-    "AR_BUENOSAIRES": "ARS",
-    "CN_SHANGHAI": "CNY",
-    "JP_TOKYO": "JPY",
-    "IN_MUMBAI": "INR",
-    "AE_DUBAI": "AED",
     "SA_RIYADH": "SAR",
-    "TR_ISTANBUL": "TRY",
-    "AU_SYDNEY": "AUD",
-    "NZ_AUCKLAND": "NZD",
-    "ZA_JOHANNESBURG": "ZAR",
+    # NOTE: ``PT_SAOPAULO`` is intentionally NOT registered — it was a
+    # mislabeled tag (São Paulo is Brazil; canonical key is ``BR_SAOPAULO``,
+    # supplied by the v3 registry). A stray ``PT_SAOPAULO`` row should hit
+    # the unknown-region path, not silently resolve.
 }
+
+
+def _build_region_currency_map() -> dict[str, str]:
+    """Derive ``{region: ISO currency}`` from the v3 catalogue + legacy aliases."""
+    out: dict[str, str] = {
+        cat.region: cat.currency for cat in CWICR_V3_CATALOGUES if cat.currency
+    }
+    # Legacy/alias keys only fill gaps — never override a canonical v3 entry.
+    for region, currency in _REGION_CURRENCY_LEGACY.items():
+        out.setdefault(region, currency)
+    return out
+
+
+_REGION_CURRENCY: dict[str, str] = _build_region_currency_map()
 
 
 # CWICR region tags follow the convention ``<2-letter country>_<UPPERCASE city>``
@@ -193,16 +190,19 @@ def _resolve_currency(
 
     Resolution order:
         1. Non-empty incoming ``currency`` (caller-supplied wins).
-        2. ``_REGION_CURRENCY[region]`` when the region matches a known key.
-        3. ``"EUR"`` as a final fallback so the API never returns an
-           empty currency string to the frontend.
+        2. ``_REGION_CURRENCY[region]`` when the region matches a known key
+           (derived from the v3 catalogue registry, so every shipped region
+           resolves to its true ISO code).
+        3. ``""`` (unset) when the region is unknown or malformed.
 
-    When falling back to EUR (step 3), a structured warning is emitted via
+    A genuinely unknown region returns an EMPTY string rather than a wrong
+    "EUR" — mislabeling a Kenyan/Thai/Korean rate as EUR silently corrupts
+    every downstream cross-currency conversion, whereas an empty currency is
+    honestly "unknown" and is rendered as such (and skipped by FX maths).
+    When the region can't be resolved a structured warning is emitted via
     ``logger.warning`` and — if a ``warnings`` list is supplied by the caller
     — a short human-readable message is appended so the route handler can
     surface it to the API response (frontend renders as a non-blocking toast).
-    Malformed region strings (not matching ``XX_CITY``) are also flagged,
-    even when the lookup would otherwise have succeeded.
     """
     if isinstance(currency, str):
         cleaned = currency.strip().upper()
@@ -214,7 +214,7 @@ def _resolve_currency(
             if not _is_valid_region_format(normalized):
                 msg = (
                     f"Cost row uses non-canonical region tag {normalized!r} "
-                    f"(expected ``XX_CITY``); currency falls back to EUR."
+                    f"(expected ``XX_CITY``); currency left unset."
                 )
                 logger.warning(msg)
                 if warnings is not None and msg not in warnings:
@@ -223,11 +223,14 @@ def _resolve_currency(
                 mapped = _REGION_CURRENCY.get(normalized)
                 if mapped:
                     return mapped
-                msg = f"Unknown region {normalized!r} — no entry in _REGION_CURRENCY; currency falls back to EUR."
+                msg = (
+                    f"Unknown region {normalized!r} — no entry in _REGION_CURRENCY "
+                    f"(add it to the CWICR catalogue registry); currency left unset."
+                )
                 logger.warning(msg)
                 if warnings is not None and msg not in warnings:
                     warnings.append(msg)
-    return "EUR"
+    return ""
 
 
 def _get_service(session: SessionDep) -> CostItemService:
@@ -1351,14 +1354,31 @@ async def vectorize_cost_items(
 ) -> JSONResponse | dict:
     """Generate embeddings and index cost items into vector DB.
 
+    Thin HTTP wrapper around :func:`vectorize_region`; the work lives in that
+    module-level helper so the partner-pack one-click installer can build the
+    vector DB through the same path without going through HTTP.
+    """
+    return await vectorize_region(session, region=region, batch_size=batch_size)
+
+
+async def vectorize_region(
+    session: AsyncSession,
+    *,
+    region: str | None = None,
+    batch_size: int = 256,
+) -> JSONResponse | dict:
+    """Embed and index the cost items of one region into the vector DB.
+
     Uses FastEmbed/ONNX (all-MiniLM-L6-v2, 384d) locally — no API key needed.
     Default backend: LanceDB (embedded, no Docker required).
 
-    Returns ``503 Service Unavailable`` when the vector backend
-    (Qdrant / LanceDB / embedding model) is not reachable or not
-    installed. Body keeps the legacy ``{"indexed": 0, "message":
-    ..., "error": ...}`` shape so existing clients still parse it;
-    only the status code flips from the previous silent 200.
+    Returns ``503 Service Unavailable`` (as a ``JSONResponse``) when the vector
+    backend (Qdrant / LanceDB / embedding model) is not reachable or not
+    installed. The body keeps the legacy ``{"indexed": 0, "message": ...,
+    "error": ...}`` shape so existing clients still parse it. The happy path
+    returns a plain ``dict``. Reusable building block shared by the
+    ``POST /vector/index/`` route and the partner-pack ``full-install``
+    orchestrator (which treats a 503 as graceful degradation, not a failure).
     """
     import asyncio
     import time
@@ -2242,7 +2262,7 @@ async def list_categories(
 
     _url = str(_engine.url)
     if "sqlite" in _url:
-        collection_expr = func.json_extract(CostItem.classification, "$.collection")
+        collection_expr = json_path_text(CostItem.classification, "$.collection")
     else:
         collection_expr = CostItem.classification["collection"].as_string()
 
@@ -3103,12 +3123,27 @@ async def load_cwicr_database(
 ) -> dict:
     """Load a CWICR regional database from local DDC Toolkit files.
 
+    Thin HTTP wrapper around :func:`load_cwicr_region`. The actual import work
+    lives in that module-level helper so the partner-pack one-click installer
+    can run the same load path without going through HTTP.
+    """
+    return await load_cwicr_region(db_id, session)
+
+
+async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
+    """Load one CWICR regional cost database into the relational store.
+
     Optimized: reads Parquet, deduplicates by rate_code (55K unique items
     from 900K total rows), then bulk-inserts into SQLite.
     Typical time: 10-30 seconds.
 
     For databases not available locally (e.g. UK_GBP, USA_USD), automatically
     downloads from GitHub and caches at ~/.openestimator/cache/.
+
+    Reusable building block shared by the ``POST /load-cwicr/{db_id}`` route and
+    the partner-pack ``full-install`` orchestrator. Raises ``HTTPException`` on
+    a missing file (404) or an import failure (500); callers that need fail-soft
+    behaviour must catch it. Returns the same body dict the route returns.
     """
     import time
 
@@ -3173,14 +3208,29 @@ async def load_cwicr_database(
     logger.info("Raw data: %d rows", total_rows)
 
     from app.config import get_settings
+    from app.database import _is_sqlite
 
     settings = get_settings()
-    sqlite_url = settings.database_url
-    db_file = sqlite_url.split("///")[-1] if "///" in sqlite_url else "openestimate.db"
+    # Dialect-aware target resolution. On SQLite we keep the fast raw-sqlite3
+    # bulk-load path (single transaction + PRAGMAs). On PostgreSQL we must NOT
+    # open a stray local ``openestimate.db`` — the worker uses a short-lived
+    # sync SQLAlchemy engine built from ``database_sync_url`` instead.
+    # Prefer the live process env: embedded PG (v6 default) sets
+    # DATABASE_URL/DATABASE_SYNC_URL there after the Settings cache is built, so
+    # the cached pydantic values can be stale/empty (mirrors auto_migrate +
+    # seed_demo_v2, which also read os.environ directly).
+    import os as _os
 
-    # Run in thread to avoid blocking the event loop during heavy pandas + sqlite work.
+    db_url = _os.environ.get("DATABASE_URL") or settings.database_url
+    sync_url = _os.environ.get("DATABASE_SYNC_URL") or settings.database_sync_url
+    if _is_sqlite(db_url):
+        target = db_url.split("///")[-1] if "///" in db_url else "openestimate.db"
+    else:
+        target = sync_url
+
+    # Run in thread to avoid blocking the event loop during heavy pandas + DB work.
     try:
-        result_data = await asyncio.to_thread(_process_and_insert_cwicr, str(cwicr_path), db_id, db_file)
+        result_data = await asyncio.to_thread(_process_and_insert_cwicr, str(cwicr_path), db_id, target)
     except Exception:
         logger.exception("CWICR import failed for %s", db_id)
         raise HTTPException(
@@ -3231,11 +3281,108 @@ async def load_cwicr_database(
     return result_data
 
 
-def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
-    """Process CWICR parquet + insert into SQLite. Runs in a SEPARATE PROCESS.
+def _pg_bulk_insert_cost_rows(sync_url: str, rows: list[tuple]) -> int:
+    """Bulk-insert CWICR cost rows into PostgreSQL, idempotent on (code, region).
 
-    Uses vectorized pandas (no iterrows!) + micro-batch SQLite inserts.
-    Completely bypasses GIL — the main process event loop stays responsive.
+    Mirrors the SQLite ``INSERT OR IGNORE`` fast path: duplicate codes per
+    region are silently skipped via ``ON CONFLICT (code, region) DO NOTHING``
+    against the ``uq_costs_code_region`` unique constraint. Runs on a short-
+    lived sync SQLAlchemy engine built from ``database_sync_url`` so the import
+    writes to the real PostgreSQL database (never a stray local SQLite file).
+
+    Args:
+        sync_url: Sync SQLAlchemy URL (e.g. ``postgresql+psycopg2://...``).
+        rows: Positional tuples in the SQLite column order
+            ``(id, code, description, unit, rate, currency, source,
+            classification, tags, components, descriptions, is_active,
+            region, metadata)``. JSON columns are pre-serialized strings and
+            are decoded back to Python objects so the JSONB columns store
+            structured values rather than double-encoded text.
+
+    Returns:
+        Number of rows actually inserted (conflicts excluded).
+    """
+    import json as _json
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    if not rows:
+        return 0
+
+    table = CostItem.__table__
+    cols = (
+        "id",
+        "code",
+        "description",
+        "unit",
+        "rate",
+        "currency",
+        "source",
+        "classification",
+        "tags",
+        "components",
+        "descriptions",
+        "is_active",
+        "region",
+        "metadata",
+    )
+    json_obj_cols = {"classification", "descriptions", "metadata"}
+    json_arr_cols = {"tags", "components"}
+
+    def _to_mapping(row: tuple) -> dict[str, Any]:
+        mapping: dict[str, Any] = {}
+        for key, value in zip(cols, row, strict=True):
+            if key in json_obj_cols and isinstance(value, str):
+                try:
+                    value = _json.loads(value)
+                except (ValueError, TypeError):
+                    value = {}
+            elif key in json_arr_cols and isinstance(value, str):
+                try:
+                    value = _json.loads(value)
+                except (ValueError, TypeError):
+                    value = []
+            elif key == "is_active":
+                value = bool(value)
+            mapping[key] = value
+        return mapping
+
+    # Embedded PostgreSQL (the v6 default) wires DATABASE_SYNC_URL into the
+    # process env *after* the pydantic Settings cache is built, so a caller may
+    # hand us an empty/stale sync URL. Fall back to the live env var (the
+    # authoritative source, same as auto_migrate_legacy_sqlite + seed_demo_v2)
+    # so the bulk load reaches the real embedded cluster instead of raising
+    # "Could not parse SQLAlchemy URL from given URL string".
+    if not sync_url:
+        import os as _os
+
+        sync_url = _os.environ.get("DATABASE_SYNC_URL", "")
+    engine = create_engine(sync_url, pool_pre_ping=True)
+    inserted = 0
+    batch_size = 1000
+    try:
+        with engine.begin() as connection:
+            for i in range(0, len(rows), batch_size):
+                chunk = [_to_mapping(r) for r in rows[i : i + batch_size]]
+                stmt = pg_insert(table).values(chunk).on_conflict_do_nothing(index_elements=["code", "region"])
+                result = connection.execute(stmt)
+                # rowcount excludes conflict-skipped rows on PostgreSQL.
+                if result.rowcount is not None and result.rowcount >= 0:
+                    inserted += result.rowcount
+    finally:
+        engine.dispose()
+    return inserted
+
+
+def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
+    """Process CWICR parquet + insert into SQLite or PostgreSQL. Runs in a thread.
+
+    Uses vectorized pandas (no iterrows!) + a single-transaction bulk load.
+    On SQLite this is a raw-sqlite3 ``INSERT OR IGNORE`` fast path; on
+    PostgreSQL it delegates to ``_pg_bulk_insert_cost_rows`` (ON CONFLICT DO
+    NOTHING). ``db_file`` carries a SQLite file path on a SQLite deployment and
+    a sync SQLAlchemy URL on a PostgreSQL deployment.
     """
     import json as _json
     import logging
@@ -3244,6 +3391,8 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
     import time
 
     import pandas as pd
+
+    from app.database import _is_sqlite
 
     _log = logging.getLogger("cwicr_import")
     start = time.monotonic()
@@ -3596,18 +3745,27 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
 
         _log.info("Built resources for %d rate_codes in %.1fs", len(resources_by_code), time.monotonic() - start)
 
-    # 5. Open SQLite with aggressive write tuning — single transaction, no
-    # per-batch commits. Empirically: micro-batch commits were the bottleneck
-    # (275 fsyncs × ~250ms = ~70s). One big transaction + synchronous=NORMAL
-    # brings insert phase from ~70s down to ~3-5s for 55K rows.
-    # isolation_level=None → we manage BEGIN/COMMIT manually (no auto-begin
-    # from the sqlite3 driver that could conflict with our transaction).
-    conn = sqlite3.connect(db_file, timeout=60, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-20000")  # 20 MB cache
+    # 5. Open the target DB. ``db_file`` carries a SQLite file path on a
+    # SQLite deployment and a sync SQLAlchemy URL (postgresql://...) on a
+    # PostgreSQL deployment — see the dialect branch in the caller. We keep
+    # the fast raw-sqlite3 single-transaction path for SQLite and fall back to
+    # a SQLAlchemy ON CONFLICT DO NOTHING bulk insert for PostgreSQL.
+    use_sqlite = _is_sqlite(db_file)
+
+    conn = None
+    if use_sqlite:
+        # Aggressive write tuning — single transaction, no per-batch commits.
+        # Empirically: micro-batch commits were the bottleneck (275 fsyncs ×
+        # ~250ms = ~70s). One big transaction + synchronous=NORMAL brings the
+        # insert phase from ~70s down to ~3-5s for 55K rows.
+        # isolation_level=None → we manage BEGIN/COMMIT manually (no auto-begin
+        # from the sqlite3 driver that could conflict with our transaction).
+        conn = sqlite3.connect(db_file, timeout=60, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-20000")  # 20 MB cache
 
     sql = """INSERT OR IGNORE INTO oe_costs_item
         (id, code, description, unit, rate, currency, source,
@@ -3615,12 +3773,22 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
          is_active, region, metadata)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
+    # CWICR parquet carries no currency column — every rate is denominated in
+    # the region's local currency. Resolve it ONCE from ``db_id`` (constant for
+    # the whole import) so each row persists its true ISO currency instead of
+    # the empty string that read-side fallbacks then had to paper over. This
+    # ``batch`` is reused for BOTH the SQLite executemany and the PostgreSQL
+    # bulk helper below, so this single value fixes both dialects.
+    resolved_currency = _resolve_currency(None, db_id)
+
     imported = 0
     skipped_count = 0
-    # Bigger chunk and only ONE commit at the end
+    # Bigger chunk and only ONE commit at the end (SQLite). On PostgreSQL we
+    # accumulate every row and hand the whole list to the PG bulk helper.
     flush_every = 5000
     batch: list[tuple] = []
-    conn.execute("BEGIN IMMEDIATE")
+    if conn is not None:
+        conn.execute("BEGIN IMMEDIATE")
 
     for rate_code, row in grouped.iterrows():
         desc = _safe_str(row.get("_desc", ""))
@@ -3727,7 +3895,7 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
                 desc[:500],
                 unit,
                 str(rate),
-                "",
+                resolved_currency,
                 "cwicr",
                 _json.dumps(classification),
                 "[]",
@@ -3739,18 +3907,24 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
             )
         )
 
-        if len(batch) >= flush_every:
+        if conn is not None and len(batch) >= flush_every:
             conn.executemany(sql, batch)
             imported += len(batch)
             batch.clear()
 
-    # Final chunk (still inside the BEGIN)
-    if batch:
-        conn.executemany(sql, batch)
-        imported += len(batch)
+    if conn is not None:
+        # Final chunk (still inside the BEGIN)
+        if batch:
+            conn.executemany(sql, batch)
+            imported += len(batch)
+        conn.execute("COMMIT")  # single commit — one fsync for the whole import
+        conn.close()
+    else:
+        # PostgreSQL: idempotent bulk insert via ON CONFLICT (code, region)
+        # DO NOTHING, batched inside a transaction. ``batch`` holds every row
+        # because the per-loop flush above is gated on the SQLite connection.
+        imported = _pg_bulk_insert_cost_rows(db_file, batch)
 
-    conn.execute("COMMIT")  # single commit — one fsync for the whole import
-    conn.close()
     elapsed = round(time.monotonic() - start, 1)
     _log.info("CWICR %s: %d imported, %d skipped in %.1fs", db_id, imported, skipped_count, elapsed)
 
@@ -3907,6 +4081,11 @@ def _bulk_insert_costs_sync(db_path: str, items: list[dict]) -> int:
     rows = []
     for item in items:
         region = item.get("region", "")
+        # Stamp the true region currency when the item didn't carry one, so
+        # rates never persist with an empty currency (mirrors the live CWICR
+        # ingest path). ``_resolve_currency`` returns "" only for genuinely
+        # unknown regions — honest, never a wrong "EUR".
+        currency = item.get("currency") or _resolve_currency(None, region)
 
         rows.append(
             (
@@ -3915,7 +4094,7 @@ def _bulk_insert_costs_sync(db_path: str, items: list[dict]) -> int:
                 item["description"][:500],
                 item["unit"][:20],
                 item["rate"],
-                item.get("currency", ""),
+                currency,
                 item.get("source", "cwicr"),
                 _json.dumps(item.get("classification", {})),
                 "[]",
@@ -3959,20 +4138,51 @@ def _bulk_insert_costs_sync(db_path: str, items: list[dict]) -> int:
 
 
 async def _bulk_insert_costs(session: AsyncSession, items: list[dict]) -> int:
-    """Async wrapper: runs bulk insert in a thread with its own SQLite connection."""
+    """Async wrapper: runs the dialect-correct bulk insert in a worker thread.
+
+    On SQLite this opens its own raw-sqlite3 connection (so it never blocks the
+    async session pool). On PostgreSQL it routes to the ON CONFLICT DO NOTHING
+    bulk helper on a short-lived sync engine — never a stray local SQLite file.
+    """
     import asyncio
 
     from app.config import get_settings
+    from app.database import _is_sqlite
 
     settings = get_settings()
-    db_url = settings.database_url
-    # Extract SQLite file path from URL like "sqlite+aiosqlite:///path/to/db"
-    if "sqlite" in db_url:
-        db_path = db_url.split("///")[-1] if "///" in db_url else "openestimate.db"
-    else:
-        db_path = "openestimate.db"
 
-    return await asyncio.to_thread(_bulk_insert_costs_sync, db_path, items)
+    if _is_sqlite(settings.database_url):
+        # Extract SQLite file path from URL like "sqlite+aiosqlite:///path/to/db".
+        db_url = settings.database_url
+        db_path = db_url.split("///")[-1] if "///" in db_url else "openestimate.db"
+        return await asyncio.to_thread(_bulk_insert_costs_sync, db_path, items)
+
+    # PostgreSQL: build positional rows matching the CWICR column order and run
+    # the idempotent ON CONFLICT (code, region) DO NOTHING bulk insert.
+    import json as _json
+
+    rows: list[tuple] = [
+        (
+            str(uuid.uuid4()),
+            item["code"],
+            item["description"][:500],
+            item["unit"][:20],
+            item["rate"],
+            # Resolve the region currency when the item has none, so PG rows
+            # never land with an empty currency (matches the SQLite path).
+            item.get("currency") or _resolve_currency(None, item.get("region", "")),
+            item.get("source", "cwicr"),
+            _json.dumps(item.get("classification", {})),
+            "[]",
+            "[]",
+            "{}",
+            1,
+            item.get("region", ""),
+            _json.dumps(item.get("metadata", {})),
+        )
+        for item in items
+    ]
+    return await asyncio.to_thread(_pg_bulk_insert_cost_rows, settings.database_sync_url, rows)
 
 
 # ── Delete CWICR database ───────────────────────────────────────────────────
@@ -4338,9 +4548,7 @@ async def get_cost_item_certainty_batch(
 
     # Only items that actually exist get a badge — resolve their ``source``
     # in one pass so the band carries the correct provenance label.
-    item_rows = await session.execute(
-        select(CostItem.id, CostItem.source).where(CostItem.id.in_(ordered_ids))
-    )
+    item_rows = await session.execute(select(CostItem.id, CostItem.source).where(CostItem.id.in_(ordered_ids)))
     source_by_id: dict[uuid.UUID, str] = {row[0]: (row[1] or "manual") for row in item_rows.all()}
 
     # Two grouped aggregates over the usage ledger — frequency + last use —
